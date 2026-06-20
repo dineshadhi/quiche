@@ -30,6 +30,7 @@ extern crate log;
 use std::net;
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 
 use ring::rand::*;
 
@@ -48,14 +49,19 @@ struct PartialResponse {
 struct Client {
     conn: quiche::Connection,
 
-    http3_conn: Option<quiche::h3::Connection>,
+    wt_conn: Option<quiche::webtransport::Connection>,
 
     partial_responses: HashMap<u64, PartialResponse>,
+
+    wt_streams: HashSet<u64>,
+
+    wt_pending_accepts: HashSet<u64>,
 }
 
 type ClientMap = HashMap<quiche::ConnectionId<'static>, Client>;
 
 fn main() {
+    env_logger::init();
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
 
@@ -75,7 +81,7 @@ fn main() {
 
     // Create the UDP listening socket, and register it with the event loop.
     let mut socket =
-        mio::net::UdpSocket::bind("127.0.0.1:4433".parse().unwrap()).unwrap();
+        mio::net::UdpSocket::bind("0.0.0.0:4433".parse().unwrap()).unwrap();
     poll.registry()
         .register(&mut socket, mio::Token(0), mio::Interest::READABLE)
         .unwrap();
@@ -94,7 +100,7 @@ fn main() {
         .set_application_protos(quiche::h3::APPLICATION_PROTOCOL)
         .unwrap();
 
-    config.set_max_idle_timeout(5000);
+    config.set_max_idle_timeout(10000000);
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_initial_max_data(10_000_000);
@@ -106,14 +112,17 @@ fn main() {
     config.set_disable_active_migration(true);
     config.enable_early_data();
 
-    let h3_config = quiche::h3::Config::new().unwrap();
+    config.enable_dgram(true, 100, 100);
+
+    let mut h3_config = quiche::h3::Config::new().unwrap();
+    h3_config.enable_extended_connect(true);
+    h3_config.enable_webtransport_draft02(true);
 
     let rng = SystemRandom::new();
     let conn_id_seed =
         ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &rng).unwrap();
 
     let mut clients = ClientMap::new();
-
     let local_addr = socket.local_addr().unwrap();
 
     loop {
@@ -274,8 +283,10 @@ fn main() {
 
                 let client = Client {
                     conn,
-                    http3_conn: None,
+                    wt_conn: None,
                     partial_responses: HashMap::new(),
+                    wt_streams: HashSet::new(),
+                    wt_pending_accepts: HashSet::new(),
                 };
 
                 clients.insert(scid.clone(), client);
@@ -306,91 +317,130 @@ fn main() {
 
             debug!("{} processed {} bytes", client.conn.trace_id(), read);
 
-            // Create a new HTTP/3 connection as soon as the QUIC connection
-            // is established.
+            // Create a new WebTransport connection (which wraps HTTP/3)
+            // as soon as the QUIC connection is established.
             if (client.conn.is_in_early_data() || client.conn.is_established()) &&
-                client.http3_conn.is_none()
+                client.wt_conn.is_none()
             {
                 debug!(
                     "{} QUIC handshake completed, now trying HTTP/3",
                     client.conn.trace_id()
                 );
 
-                let h3_conn = match quiche::h3::Connection::with_transport(
+                match quiche::webtransport::Connection::with_transport(
                     &mut client.conn,
                     &h3_config,
                 ) {
-                    Ok(v) => v,
+                    Ok(wt) => {
+                        client.wt_conn = Some(wt);
+                    },
 
                     Err(e) => {
-                        error!("failed to create HTTP/3 connection: {e}");
+                        error!("failed to create WebTransport connection: {e}");
                         continue 'read;
                     },
                 };
-
-                // TODO: sanity check h3 connection before adding to map
-                client.http3_conn = Some(h3_conn);
             }
 
-            if client.http3_conn.is_some() {
+            if client.wt_conn.is_some() {
                 // Handle writable streams.
                 for stream_id in client.conn.writable() {
-                    handle_writable(client, stream_id);
+                    handle_writable(
+                        &mut client.conn,
+                        &mut client.wt_conn,
+                        stream_id,
+                        &mut client.partial_responses,
+                        &mut client.wt_pending_accepts,
+                    );
                 }
             }
 
-            if let Some(http3_conn) = client.http3_conn.as_mut() {
-                // Process HTTP/3 events.
+            if let Some(wt_conn) = client.wt_conn.as_mut() {
                 loop {
-                    match http3_conn.poll(&mut client.conn) {
-                        Ok((
-                            stream_id,
-                            quiche::h3::Event::Headers { list, .. },
-                        )) => {
-                            handle_request(
-                                &mut client.conn,
-                                http3_conn,
-                                stream_id,
-                                &list,
-                                &mut client.partial_responses,
-                                "examples/root",
-                            );
-                        },
+                    let (stream_id, event) = match wt_conn.poll(&mut client.conn)
+                    {
+                        Ok(v) => v,
 
-                        Ok((stream_id, quiche::h3::Event::Data)) => {
-                            info!(
-                                "{} got data on stream id {}",
-                                client.conn.trace_id(),
-                                stream_id
-                            );
-                        },
-
-                        Ok((_stream_id, quiche::h3::Event::Finished)) => (),
-
-                        Ok((_stream_id, quiche::h3::Event::Reset { .. })) => (),
-
-                        Ok((
-                            _prioritized_element_id,
-                            quiche::h3::Event::PriorityUpdate,
-                        )) => (),
-
-                        Ok((_goaway_id, quiche::h3::Event::GoAway)) => (),
-
-                        Err(quiche::h3::Error::Done) => {
-                            break;
-                        },
+                        Err(quiche::h3::Error::Done) => break,
 
                         Err(e) => {
                             error!(
                                 "{} HTTP/3 error {:?}",
                                 client.conn.trace_id(),
-                                e
+                                e,
                             );
 
                             break;
                         },
+                    };
 
-                        _ => {},
+                    match event {
+                        quiche::webtransport::Event::H3(inner) => {
+                            log::info!(
+                                "{} H3 event on stream {}: {:?}",
+                                client.conn.trace_id(),
+                                stream_id,
+                                inner,
+                            );
+                        },
+
+                        quiche::webtransport::Event::SessionRequest {
+                            headers,
+                        } => {
+                            handle_request(
+                                &mut client.conn,
+                                wt_conn,
+                                stream_id,
+                                &headers,
+                                &mut client.partial_responses,
+                                &mut client.wt_pending_accepts,
+                                "examples/root",
+                            );
+                        },
+
+                        quiche::webtransport::Event::Stream { session_id } => {
+                            log::info!(
+                                "New WT Stream {stream_id}, session_id {session_id}",
+                            );
+                            client.wt_streams.insert(stream_id);
+                        },
+
+                        quiche::webtransport::Event::Data => {
+                            log::info!("New Web Data Event");
+                            let mut buf = [0; 1024];
+                            while let Ok(read) = wt_conn.stream_recv_data(
+                                &mut client.conn,
+                                stream_id,
+                                &mut buf,
+                            ) {
+                                info!(
+                                    "{} read {} bytes on wt stream {}: {:?}",
+                                    client.conn.trace_id(),
+                                    read,
+                                    stream_id,
+                                    String::from_utf8_lossy(&buf[..read]),
+                                );
+                            }
+
+                            let sid = match stream_id & 0x2 == 0 {
+                                true => wt_conn
+                                    .open_bi_stream(&mut client.conn)
+                                    .unwrap(),
+                                false => wt_conn
+                                    .open_uni_stream(&mut client.conn)
+                                    .unwrap(),
+                            };
+
+                            let n = wt_conn
+                                .stream_write_data(
+                                    &mut client.conn,
+                                    sid,
+                                    &buf[..read],
+                                    false,
+                                )
+                                .unwrap();
+                            info!("Wrote back {n}");
+                        },
                     }
                 }
             }
@@ -505,9 +555,11 @@ fn validate_token<'a>(
 
 /// Handles incoming HTTP/3 requests.
 fn handle_request(
-    conn: &mut quiche::Connection, http3_conn: &mut quiche::h3::Connection,
-    stream_id: u64, headers: &[quiche::h3::Header],
-    partial_responses: &mut HashMap<u64, PartialResponse>, root: &str,
+    conn: &mut quiche::Connection,
+    wt_conn: &mut quiche::webtransport::Connection, stream_id: u64,
+    headers: &[quiche::h3::Header],
+    partial_responses: &mut HashMap<u64, PartialResponse>,
+    wt_pending_accepts: &mut HashSet<u64>, _root: &str,
 ) {
     info!(
         "{} got request {:?} on stream id {}",
@@ -516,124 +568,82 @@ fn handle_request(
         stream_id
     );
 
-    // We decide the response based on headers alone, so stop reading the
-    // request stream so that any body is ignored and pointless Data events
-    // are not generated.
-    conn.stream_shutdown(stream_id, quiche::Shutdown::Read, 0)
-        .unwrap();
+    if headers
+        .iter()
+        .any(|h| h.name() == b":method" && h.value() == b"CONNECT")
+    {
+        info!(
+            "{} accepting WebTransport on stream {}",
+            conn.trace_id(),
+            stream_id
+        );
 
-    let (headers, body) = build_response(root, headers);
+        match wt_conn.accept(conn, stream_id) {
+            Ok(()) => {
+                info!("{} WebTransport session established", conn.trace_id());
+            },
 
-    match http3_conn.send_response(conn, stream_id, &headers, false) {
-        Ok(v) => v,
+            Err(quiche::h3::Error::StreamBlocked) => {
+                let headers = vec![quiche::h3::Header::new(b":status", b"200")];
 
-        Err(quiche::h3::Error::StreamBlocked) => {
-            let response = PartialResponse {
-                headers: Some(headers),
-                body,
-                written: 0,
-            };
+                let response = PartialResponse {
+                    headers: Some(headers),
+                    body: Vec::new(),
+                    written: 0,
+                };
 
-            partial_responses.insert(stream_id, response);
-            return;
-        },
+                partial_responses.insert(stream_id, response);
+                wt_pending_accepts.insert(stream_id);
+                return;
+            },
 
-        Err(e) => {
-            error!("{} stream send failed {:?}", conn.trace_id(), e);
-            return;
-        },
-    }
-
-    let written = match http3_conn.send_body(conn, stream_id, &body, true) {
-        Ok(v) => v,
-
-        Err(quiche::h3::Error::Done) => 0,
-
-        Err(e) => {
-            error!("{} stream send failed {:?}", conn.trace_id(), e);
-            return;
-        },
-    };
-
-    if written < body.len() {
-        let response = PartialResponse {
-            headers: None,
-            body,
-            written,
-        };
-
-        partial_responses.insert(stream_id, response);
-    }
-}
-
-/// Builds an HTTP/3 response given a request.
-fn build_response(
-    root: &str, request: &[quiche::h3::Header],
-) -> (Vec<quiche::h3::Header>, Vec<u8>) {
-    let mut file_path = std::path::PathBuf::from(root);
-    let mut path = std::path::Path::new("");
-    let mut method = None;
-
-    // Look for the request's path and method.
-    for hdr in request {
-        match hdr.name() {
-            b":path" =>
-                path = std::path::Path::new(
-                    std::str::from_utf8(hdr.value()).unwrap(),
-                ),
-
-            b":method" => method = Some(hdr.value()),
-
-            _ => (),
+            Err(e) => {
+                error!("{} stream send failed {:?}", conn.trace_id(), e);
+                return;
+            },
         }
+        return;
     }
-
-    let (status, body) = match method {
-        Some(b"GET") => {
-            for c in path.components() {
-                if let std::path::Component::Normal(v) = c {
-                    file_path.push(v)
-                }
-            }
-
-            match std::fs::read(file_path.as_path()) {
-                Ok(data) => (200, data),
-
-                Err(_) => (404, b"Not Found!".to_vec()),
-            }
-        },
-
-        _ => (405, Vec::new()),
-    };
-
-    let headers = vec![
-        quiche::h3::Header::new(b":status", status.to_string().as_bytes()),
-        quiche::h3::Header::new(b"server", b"quiche"),
-        quiche::h3::Header::new(
-            b"content-length",
-            body.len().to_string().as_bytes(),
-        ),
-    ];
-
-    (headers, body)
 }
 
 /// Handles newly writable streams.
-fn handle_writable(client: &mut Client, stream_id: u64) {
-    let conn = &mut client.conn;
-    let http3_conn = &mut client.http3_conn.as_mut().unwrap();
-
+fn handle_writable(
+    conn: &mut quiche::Connection,
+    wt_conn: &mut Option<quiche::webtransport::Connection>, stream_id: u64,
+    partial_responses: &mut HashMap<u64, PartialResponse>,
+    wt_pending_accepts: &mut HashSet<u64>,
+) {
     debug!("{} stream {} is writable", conn.trace_id(), stream_id);
 
-    if !client.partial_responses.contains_key(&stream_id) {
+    if !partial_responses.contains_key(&stream_id) {
         return;
     }
 
-    let resp = client.partial_responses.get_mut(&stream_id).unwrap();
+    let resp = partial_responses.get_mut(&stream_id).unwrap();
+
+    let wt_conn = match wt_conn {
+        Some(c) => c,
+        None => return,
+    };
 
     if let Some(ref headers) = resp.headers {
-        match http3_conn.send_response(conn, stream_id, headers, false) {
-            Ok(_) => (),
+        info!(
+            "{} sending partial response headers {:?} on stream {}",
+            conn.trace_id(),
+            hdrs_to_strings(headers),
+            stream_id,
+        );
+
+        match wt_conn.send_response(conn, stream_id, headers, false) {
+            Ok(_) => {
+                resp.headers = None;
+
+                // If this was a deferred WebTransport accept, set the
+                // session ID now that the 200 response has been sent.
+                if wt_pending_accepts.remove(&stream_id) {
+                    wt_conn.set_session_id(stream_id);
+                }
+            },
 
             Err(quiche::h3::Error::StreamBlocked) => {
                 return;
@@ -646,17 +656,15 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
         }
     }
 
-    resp.headers = None;
-
     let body = &resp.body[resp.written..];
 
-    let written = match http3_conn.send_body(conn, stream_id, body, true) {
+    let written = match wt_conn.stream_write_data(conn, stream_id, body, true) {
         Ok(v) => v,
 
         Err(quiche::h3::Error::Done) => 0,
 
         Err(e) => {
-            client.partial_responses.remove(&stream_id);
+            partial_responses.remove(&stream_id);
 
             error!("{} stream send failed {:?}", conn.trace_id(), e);
             return;
@@ -666,7 +674,7 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
     resp.written += written;
 
     if resp.written == resp.body.len() {
-        client.partial_responses.remove(&stream_id);
+        partial_responses.remove(&stream_id);
     }
 }
 

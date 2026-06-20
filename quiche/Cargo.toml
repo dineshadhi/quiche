@@ -95,6 +95,7 @@ windows-sys = { version = "0.59", features = [
 [dev-dependencies]
 mio = { workspace = true, features = ["net", "os-poll"] }
 ring = { workspace = true }
+env_logger = { workspace = true }
 rstest = { workspace = true }
 url = { workspace = true }
 

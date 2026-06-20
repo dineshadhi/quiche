@@ -1,0 +1,9 @@
+cert :
+    mkcert -install
+    mkcert -ecdsa -cert-file examples/cert.crt -key-file examples/cert.key localhost 127.0.0.1 ::1 192.168.0.176
+
+wt-server log="debug" :
+    RUST_LOG={{log}} cargo run --example wt-server
+    
+wt-client log="debug" url="https://localhost:4433" :
+    RUST_LOG={{log}} cargo run --example wt-client {{url}}

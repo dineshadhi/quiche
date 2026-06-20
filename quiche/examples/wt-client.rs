@@ -1,4 +1,4 @@
-// Copyright (C) 2019, Cloudflare, Inc.
+// Copyright (C) 2024, Cloudflare, Inc.
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -34,6 +34,7 @@ use ring::rand::*;
 const MAX_DATAGRAM_SIZE: usize = 1350;
 
 fn main() {
+    env_logger::init();
     let mut buf = [0; 65535];
     let mut out = [0; MAX_DATAGRAM_SIZE];
 
@@ -57,15 +58,12 @@ fn main() {
     let peer_addr = url.socket_addrs(|| None).unwrap()[0];
 
     // Bind to INADDR_ANY or IN6ADDR_ANY depending on the IP family of the
-    // server address. This is needed on macOS and BSD variants that don't
-    // support binding to IN6ADDR_ANY for both v4 and v6.
+    // server address.
     let bind_addr = match peer_addr {
         std::net::SocketAddr::V4(_) => "0.0.0.0:0",
         std::net::SocketAddr::V6(_) => "[::]:0",
     };
 
-    // Create the UDP socket backing the QUIC connection, and register it with
-    // the event loop.
     let mut socket =
         mio::net::UdpSocket::bind(bind_addr.parse().unwrap()).unwrap();
     poll.registry()
@@ -92,8 +90,10 @@ fn main() {
     config.set_initial_max_streams_bidi(100);
     config.set_initial_max_streams_uni(100);
     config.set_disable_active_migration(true);
+    config.enable_dgram(true, 100, 100);
 
-    let mut http3_conn = None;
+    let mut h3_config = quiche::h3::Config::new().unwrap();
+    h3_config.enable_webtransport_draft02(true);
 
     // Generate a random source connection ID for the connection.
     let mut scid = [0; quiche::MAX_CONN_ID_LEN];
@@ -129,30 +129,12 @@ fn main() {
 
     debug!("written {write}");
 
-    let h3_config = quiche::h3::Config::new().unwrap();
+    let mut wt_conn = None;
+    let mut wt_session_established = false;
+    let mut wt_data_sent = false;
+    let mut wt_data_received = false;
 
-    // Prepare request.
-    let mut path = String::from(url.path());
-
-    if let Some(query) = url.query() {
-        path.push('?');
-        path.push_str(query);
-    }
-
-    let req = vec![
-        quiche::h3::Header::new(b":method", b"GET"),
-        quiche::h3::Header::new(b":scheme", url.scheme().as_bytes()),
-        quiche::h3::Header::new(
-            b":authority",
-            url.host_str().unwrap().as_bytes(),
-        ),
-        quiche::h3::Header::new(b":path", path.as_bytes()),
-        quiche::h3::Header::new(b"user-agent", b"quiche"),
-    ];
-
-    let req_start = std::time::Instant::now();
-
-    let mut req_sent = false;
+    let send_data = b"Hello, WebTransport!";
 
     loop {
         poll.poll(&mut events, conn.timeout()).unwrap();
@@ -160,9 +142,6 @@ fn main() {
         // Read incoming UDP packets from the socket and feed them to quiche,
         // until there are no more packets to read.
         'read: loop {
-            // If the event loop reported no events, it means that the timeout
-            // has expired, so handle it without attempting to read packets. We
-            // will then proceed with the send loop.
             if events.is_empty() {
                 debug!("timed out");
 
@@ -175,8 +154,6 @@ fn main() {
                 Ok(v) => v,
 
                 Err(e) => {
-                    // There are no more UDP packets to read, so end the read
-                    // loop.
                     if e.kind() == std::io::ErrorKind::WouldBlock {
                         debug!("recv() would block");
                         break 'read;
@@ -189,7 +166,7 @@ fn main() {
             debug!("got {len} bytes");
 
             let recv_info = quiche::RecvInfo {
-                to: local_addr,
+                to: socket.local_addr().unwrap(),
                 from,
             };
 
@@ -213,71 +190,132 @@ fn main() {
             break;
         }
 
-        // Create a new HTTP/3 connection once the QUIC connection is established.
-        if conn.is_established() && http3_conn.is_none() {
-            http3_conn = Some(
-                quiche::h3::Connection::with_transport(&mut conn, &h3_config)
-                .expect("Unable to create HTTP/3 connection, check the server's uni stream limit and window size"),
+        // Create a new WebTransport connection once the QUIC handshake
+        // completes.
+        if (conn.is_in_early_data() || conn.is_established()) && wt_conn.is_none()
+        {
+            debug!(
+                "{} QUIC handshake completed, now creating WebTransport",
+                conn.trace_id()
             );
+
+            match quiche::webtransport::Connection::with_transport(
+                &mut conn, &h3_config,
+            ) {
+                Ok(wt) => {
+                    wt_conn = Some(wt);
+                },
+
+                Err(e) => {
+                    error!("failed to create WebTransport connection: {e}");
+                    break;
+                },
+            };
         }
 
-        // Send HTTP requests once the QUIC connection is established, and until
-        // all requests have been sent.
-        if let Some(h3_conn) = &mut http3_conn {
-            if !req_sent {
-                info!("sending HTTP request {req:?}");
+        if let Some(wt_conn) = &mut wt_conn {
+            // Establish the WebTransport session via extended CONNECT.
+            if !wt_session_established {
+                info!("sending WebTransport CONNECT");
 
-                h3_conn.send_request(&mut conn, &req, true).unwrap();
+                let authority = url.host_str().unwrap().as_bytes();
+                let path = url.path().as_bytes();
+                let origin = url.host_str().unwrap().as_bytes();
 
-                req_sent = true;
-            }
-        }
-
-        if let Some(http3_conn) = &mut http3_conn {
-            // Process HTTP/3 events.
-            loop {
-                match http3_conn.poll(&mut conn) {
-                    Ok((stream_id, quiche::h3::Event::Headers { list, .. })) => {
+                match wt_conn.connect(&mut conn, authority, path, origin) {
+                    Ok(stream_id) => {
                         info!(
-                            "got response headers {:?} on stream id {}",
-                            hdrs_to_strings(&list),
+                            "WebTransport CONNECT sent on stream {}",
                             stream_id
                         );
+                        wt_session_established = true;
                     },
 
-                    Ok((stream_id, quiche::h3::Event::Data)) => {
-                        while let Ok(read) =
-                            http3_conn.recv_body(&mut conn, stream_id, &mut buf)
-                        {
-                            debug!(
-                                "got {read} bytes of response data on stream {stream_id}"
-                            );
+                    Err(e) => {
+                        error!("failed to send CONNECT: {e}");
+                        break;
+                    },
+                }
+            }
 
-                            print!("{}", unsafe {
-                                std::str::from_utf8_unchecked(&buf[..read])
-                            });
+            // Open a bidirectional stream and send data.
+            if wt_session_established && !wt_data_sent {
+                match wt_conn.open_bi_stream(&mut conn) {
+                    Ok(stream_id) => {
+                        info!("opened bidirectional stream {}", stream_id);
+
+                        match wt_conn.stream_write_data(
+                            &mut conn, stream_id, send_data, true,
+                        ) {
+                            Ok(n) => {
+                                info!("sent {} bytes on stream {}", n, stream_id);
+                                wt_data_sent = true;
+                            },
+
+                            Err(e) => {
+                                error!("failed to write data: {e}");
+                                break;
+                            },
                         }
                     },
 
-                    Ok((_stream_id, quiche::h3::Event::Finished)) => {
+                    Err(e) => {
+                        error!("failed to open bi stream: {e}");
+                        break;
+                    },
+                }
+            }
+
+            // Process WebTransport events.
+            loop {
+                match wt_conn.poll(&mut conn) {
+                    Ok((stream_id, quiche::webtransport::Event::H3(e))) => {
+                        info!("H3 event on stream {}: {:?}", stream_id, e,);
+                    },
+
+                    Ok((
+                        _stream_id,
+                        quiche::webtransport::Event::SessionRequest { headers },
+                    )) => {
                         info!(
-                            "response received in {:?}, closing...",
-                            req_start.elapsed()
+                            "received session request: {:?}",
+                            hdrs_to_strings(&headers),
                         );
-
-                        conn.close(true, 0x100, b"kthxbye").unwrap();
                     },
 
-                    Ok((_stream_id, quiche::h3::Event::Reset(e))) => {
-                        error!("request was reset by peer with {e}, closing...");
-
-                        conn.close(true, 0x100, b"kthxbye").unwrap();
+                    Ok((
+                        stream_id,
+                        quiche::webtransport::Event::Stream { session_id },
+                    )) => {
+                        info!(
+                            "new WebTransport stream {}, session {}",
+                            stream_id, session_id,
+                        );
                     },
 
-                    Ok((_, quiche::h3::Event::PriorityUpdate)) => unreachable!(),
+                    Ok((stream_id, quiche::webtransport::Event::Data)) => {
+                        info!("data available on stream {}", stream_id);
 
-                    Ok((goaway_id, quiche::h3::Event::GoAway)) => {
-                        info!("GOAWAY id={goaway_id}");
+                        let mut rbuf = [0; 1024];
+                        let read = match wt_conn
+                            .stream_recv_data(&mut conn, stream_id, &mut rbuf)
+                        {
+                            Ok(n) => n,
+
+                            Err(e) => {
+                                error!(
+                                    "failed to read data on stream {}: {:?}",
+                                    stream_id, e,
+                                );
+                                break;
+                            },
+                        };
+
+                        info!("{}", String::from_utf8_lossy(&rbuf[..read]),);
+
+                        wt_data_received = true;
+
+                        wt_conn.close(&mut conn).ok();
                     },
 
                     Err(quiche::h3::Error::Done) => {
@@ -285,18 +323,15 @@ fn main() {
                     },
 
                     Err(e) => {
-                        error!("HTTP/3 processing failed: {e:?}");
-
+                        error!("WebTransport poll failed: {e:?}");
                         break;
                     },
-
-                    _ => {},
                 }
             }
         }
 
-        // Generate outgoing QUIC packets and send them on the UDP socket, until
-        // quiche reports that there are no more packets to be sent.
+        // Generate outgoing QUIC packets and send them on the UDP socket,
+        // until quiche reports that there are no more packets to be sent.
         loop {
             let (write, send_info) = match conn.send(&mut out) {
                 Ok(v) => v,
@@ -329,6 +364,12 @@ fn main() {
         if conn.is_closed() {
             info!("connection closed, {:?}", conn.stats());
             break;
+        }
+
+        // Close after we've received the echo.
+        if wt_data_received {
+            info!("echo received, closing connection");
+            conn.close(true, 0x0, b"done").ok();
         }
     }
 }
