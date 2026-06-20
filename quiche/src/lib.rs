@@ -9509,3 +9509,4 @@ mod recovery;
 mod stream;
 mod tls;
 mod transport_params;
+pub mod webtransport;
