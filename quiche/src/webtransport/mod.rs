@@ -273,3 +273,517 @@ pub mod testing {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use crate::h3;
+    use crate::h3::NameValue;
+
+    /// Client sends CONNECT, server accepts, both sides drain cleanly.
+    #[test]
+    fn wt_connect_accept() {
+        let mut s = Session::new().unwrap();
+
+        let stream_id =
+            s.client_connect(b"localhost", b"/", b"localhost").unwrap();
+
+        let (sid, ev) = s.poll_server().unwrap();
+        assert_eq!(sid, stream_id);
+        match ev {
+            super::Event::SessionRequest { .. } => {},
+            _ => panic!("expected SessionRequest"),
+        }
+
+        s.server_accept(stream_id).unwrap();
+
+        let (sid, ev) = s.poll_client().unwrap();
+        assert_eq!(sid, stream_id);
+        match ev {
+            super::Event::H3(h3::Event::Headers { .. }) => {},
+            _ => panic!("expected H3(Headers)"),
+        }
+
+        assert_eq!(s.poll_client(), Err(h3::Error::Done));
+        assert_eq!(s.poll_server(), Err(h3::Error::Done));
+    }
+
+    /// Server sends 200 before setting session_id, then opens WT uni stream.
+    #[test]
+    fn wt_connect_deferred_accept() {
+        let mut s = Session::new().unwrap();
+
+        let stream_id =
+            s.client_connect(b"localhost", b"/", b"localhost").unwrap();
+
+        let (sid, _ev) = s.poll_server().unwrap();
+        assert_eq!(sid, stream_id);
+
+        s.server_accept_deferred(stream_id).unwrap();
+
+        let (sid, ev) = s.poll_client().unwrap();
+        assert_eq!(sid, stream_id);
+        match ev {
+            super::Event::H3(h3::Event::Headers { .. }) => {},
+            _ => panic!("expected H3(Headers)"),
+        }
+
+        let uni = s.open_uni_client().unwrap();
+        assert!(uni > 0);
+
+        assert_eq!(s.poll_client(), Err(h3::Error::Done));
+
+        // Server receives a Stream event for the new WebTransport uni stream.
+        let (sid, ev) = s.poll_server().unwrap();
+        assert_eq!(sid, uni);
+        assert!(matches!(ev, super::Event::Stream { .. }));
+
+        assert_eq!(s.poll_client(), Err(h3::Error::Done));
+        assert_eq!(s.poll_server(), Err(h3::Error::Done));
+    }
+
+    /// Client sends data on a WT uni stream, server receives Stream + Data.
+    #[test]
+    fn wt_uni_stream() {
+        let mut s = Session::new().unwrap();
+
+        let session_id =
+            s.client_connect(b"localhost", b"/", b"localhost").unwrap();
+        let (sid, _ev) = s.poll_server().unwrap();
+        assert_eq!(sid, session_id);
+        s.server_accept(session_id).unwrap();
+        let (sid, _ev) = s.poll_client().unwrap();
+        assert_eq!(sid, session_id);
+
+        let stream_id = s.open_uni_client().unwrap();
+        let data = b"hello uni";
+        s.send_data_client(stream_id, data, true).unwrap();
+        s.advance().unwrap();
+
+        let (sid, ev) = s.poll_server().unwrap();
+        assert_eq!(sid, stream_id);
+        match ev {
+            super::Event::Stream { session_id: sid } => {
+                assert_eq!(sid, session_id);
+            },
+            _ => panic!("expected Stream event"),
+        }
+
+        let (sid, ev) = s.poll_server().unwrap();
+        assert_eq!(sid, stream_id);
+        assert!(matches!(ev, super::Event::Data));
+
+        let mut buf = [0; 1024];
+        let n = s.recv_data_server(stream_id, &mut buf).unwrap();
+        assert_eq!(&buf[..n], data);
+
+        assert_eq!(s.poll_client(), Err(h3::Error::Done));
+        assert_eq!(s.poll_server(), Err(h3::Error::Done));
+    }
+
+    /// Bidirectional WT stream: client sends, server echoes back.
+    #[test]
+    fn wt_bi_stream_echo() {
+        let mut s = Session::new().unwrap();
+
+        let session_id =
+            s.client_connect(b"localhost", b"/", b"localhost").unwrap();
+        let (sid, _ev) = s.poll_server().unwrap();
+        assert_eq!(sid, session_id);
+        s.server_accept(session_id).unwrap();
+        let (sid, _ev) = s.poll_client().unwrap();
+        assert_eq!(sid, session_id);
+
+        let stream_id = s.open_bi_client().unwrap();
+        let data = b"ping";
+        s.send_data_client(stream_id, data, true).unwrap();
+        s.advance().unwrap();
+
+        let (sid, ev) = s.poll_server().unwrap();
+        assert_eq!(sid, stream_id);
+        assert!(matches!(ev, super::Event::Stream { .. }));
+
+        let (sid, ev) = s.poll_server().unwrap();
+        assert_eq!(sid, stream_id);
+        assert!(matches!(ev, super::Event::Data));
+
+        let mut buf = [0; 1024];
+        let n = s.recv_data_server(stream_id, &mut buf).unwrap();
+        assert_eq!(&buf[..n], data);
+
+        s.send_data_server(stream_id, data, true).unwrap();
+        s.advance().unwrap();
+
+        let (sid, ev) = s.poll_client().unwrap();
+        assert_eq!(sid, stream_id);
+        assert!(matches!(ev, super::Event::Data));
+
+        let n = s.recv_data_client(stream_id, &mut buf).unwrap();
+        assert_eq!(&buf[..n], data);
+
+        assert_eq!(s.poll_client(), Err(h3::Error::Done));
+        assert_eq!(s.poll_server(), Err(h3::Error::Done));
+    }
+
+    /// Multiple uni + bi WT streams are opened and deliver data to server.
+    #[test]
+    fn wt_multiple_streams() {
+        let mut s = Session::new().unwrap();
+
+        let session_id =
+            s.client_connect(b"localhost", b"/", b"localhost").unwrap();
+        let (sid, _ev) = s.poll_server().unwrap();
+        assert_eq!(sid, session_id);
+        s.server_accept(session_id).unwrap();
+        let (sid, _ev) = s.poll_client().unwrap();
+        assert_eq!(sid, session_id);
+
+        let uni1 = s.open_uni_client().unwrap();
+        let uni2 = s.open_uni_client().unwrap();
+        let uni3 = s.open_uni_client().unwrap();
+        let bi1 = s.open_bi_client().unwrap();
+        let bi2 = s.open_bi_client().unwrap();
+
+        s.send_data_client(uni1, b"u1", true).unwrap();
+        s.send_data_client(uni2, b"u2", true).unwrap();
+        s.send_data_client(uni3, b"u3", true).unwrap();
+        s.send_data_client(bi1, b"b1", true).unwrap();
+        s.send_data_client(bi2, b"b2", true).unwrap();
+        s.advance().unwrap();
+
+        let mut stream_events = Vec::new();
+        let mut data_sids = Vec::new();
+        while let Ok((sid, ev)) = s.poll_server() {
+            match ev {
+                super::Event::Stream { .. } => stream_events.push(sid),
+                super::Event::Data => data_sids.push(sid),
+                _ => {},
+            }
+        }
+
+        assert_eq!(stream_events.len(), 5);
+        assert_eq!(data_sids.len(), 5);
+
+        let expected = [
+            (uni1, b"u1"),
+            (uni2, b"u2"),
+            (uni3, b"u3"),
+            (bi1, b"b1"),
+            (bi2, b"b2"),
+        ];
+        let mut buf = [0; 1024];
+        for (stream_id, want) in &expected {
+            let n = s.recv_data_server(*stream_id, &mut buf).unwrap();
+            assert_eq!(&buf[..n], *want);
+        }
+    }
+
+    /// Client closes the WT session, server receives Finished on CONNECT.
+    #[test]
+    fn wt_session_close() {
+        let mut s = Session::new().unwrap();
+
+        let stream_id =
+            s.client_connect(b"localhost", b"/", b"localhost").unwrap();
+        let (sid, _ev) = s.poll_server().unwrap();
+        assert_eq!(sid, stream_id);
+        s.server_accept(stream_id).unwrap();
+        let (sid, _ev) = s.poll_client().unwrap();
+        assert_eq!(sid, stream_id);
+
+        s.close_session_client().unwrap();
+
+        let (sid, ev) = s.poll_server().unwrap();
+        assert_eq!(sid, stream_id);
+        match ev {
+            super::Event::H3(h3::Event::Finished) => {},
+            _ => panic!("expected H3(Finished)"),
+        }
+
+        assert_eq!(s.poll_client(), Err(h3::Error::Done));
+        assert_eq!(s.poll_server(), Err(h3::Error::Done));
+    }
+
+    /// open_uni_stream and open_bi_stream fail when no session is established.
+    #[test]
+    fn wt_operations_without_session() {
+        let mut s = Session::new().unwrap();
+
+        assert_eq!(
+            s.client.open_uni_stream(&mut s.pipe.client),
+            Err(h3::Error::InternalError),
+        );
+        assert_eq!(
+            s.client.open_bi_stream(&mut s.pipe.client),
+            Err(h3::Error::InternalError),
+        );
+    }
+
+    /// Server opens a WT uni stream, client receives Stream event.
+    #[test]
+    fn wt_peer_initiated_stream() {
+        let mut s = Session::new().unwrap();
+
+        let session_id =
+            s.client_connect(b"localhost", b"/", b"localhost").unwrap();
+        let (sid, _ev) = s.poll_server().unwrap();
+        assert_eq!(sid, session_id);
+        s.server_accept(session_id).unwrap();
+        let (sid, _ev) = s.poll_client().unwrap();
+        assert_eq!(sid, session_id);
+
+        let server_stream = s.open_uni_server().unwrap();
+
+        let (sid, ev) = s.poll_client().unwrap();
+        assert_eq!(sid, server_stream);
+        match ev {
+            super::Event::Stream { session_id: sid } => {
+                assert_eq!(sid, session_id);
+            },
+            _ => panic!("expected Stream event"),
+        }
+
+        assert_eq!(s.poll_client(), Err(h3::Error::Done));
+        assert_eq!(s.poll_server(), Err(h3::Error::Done));
+    }
+
+    /// HTTP/3 request and WT uni stream coexist on the same connection.
+    #[test]
+    fn wt_h3_interop() {
+        let mut s = Session::new().unwrap();
+
+        // Establish a WebTransport session.
+        let session_id =
+            s.client_connect(b"localhost", b"/", b"localhost").unwrap();
+        let (sid, ev) = s.poll_server().unwrap();
+        assert_eq!(sid, session_id);
+        assert!(matches!(ev, super::Event::SessionRequest { .. }));
+        s.server_accept(session_id).unwrap();
+        let (sid, ev) = s.poll_client().unwrap();
+        assert_eq!(sid, session_id);
+        assert!(matches!(ev, super::Event::H3(h3::Event::Headers { .. })));
+
+        // Send a regular HTTP GET request via the underlying h3 connection.
+        let req_headers = vec![
+            h3::Header::new(b":method", b"GET"),
+            h3::Header::new(b":scheme", b"https"),
+            h3::Header::new(b":authority", b"localhost"),
+            h3::Header::new(b":path", b"/test"),
+        ];
+        let req_stream_id = s
+            .client
+            .h3_conn
+            .send_request(&mut s.pipe.client, &req_headers, true)
+            .unwrap();
+
+        // Also open a WebTransport uni stream.
+        let wt_stream = s.open_uni_client().unwrap();
+
+        // Server should get the HTTP request and the WT stream (any order).
+        let mut h3_ok = false;
+        let mut wt_ok = false;
+        while let Ok((sid, ev)) = s.poll_server() {
+            match ev {
+                super::Event::H3(h3::Event::Headers { .. }) => {
+                    assert_eq!(sid, req_stream_id);
+                    h3_ok = true;
+                },
+                super::Event::Stream { .. } => {
+                    assert_eq!(sid, wt_stream);
+                    wt_ok = true;
+                },
+                _ => {},
+            }
+        }
+        assert!(h3_ok);
+        assert!(wt_ok);
+
+        assert_eq!(s.poll_client(), Err(h3::Error::Done));
+        assert_eq!(s.poll_server(), Err(h3::Error::Done));
+    }
+
+    /// Stream ID is not advanced when open_uni_stream fails (StreamLimit).
+    #[test]
+    fn wt_stream_id_not_consumed_on_fail() {
+        let mut config = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        config.set_initial_max_data(10_000_000);
+        config.set_initial_max_stream_data_bidi_local(1_000_000);
+        config.set_initial_max_stream_data_bidi_remote(1_000_000);
+        config.set_initial_max_stream_data_uni(1_000_000);
+        config.set_initial_max_streams_bidi(100);
+        config.set_initial_max_streams_uni(3);
+        config.verify_peer(false);
+        config.enable_dgram(true, 100, 100);
+        config.set_ack_delay_exponent(8);
+        config.grease(false);
+
+        let mut h3_config = h3::Config::new().unwrap();
+        h3_config.enable_extended_connect(true);
+        h3_config.enable_webtransport_draft02(true);
+
+        let mut s = Session::with_configs(&mut config, &h3_config).unwrap();
+
+        let stream_id =
+            s.client_connect(b"localhost", b"/", b"localhost").unwrap();
+        let (sid, _ev) = s.poll_server().unwrap();
+        assert_eq!(sid, stream_id);
+        s.server_accept(stream_id).unwrap();
+        let (sid, ev) = s.poll_client().unwrap();
+        assert_eq!(sid, stream_id);
+        assert!(matches!(ev, super::Event::H3(h3::Event::Headers { .. })));
+
+        // The first 3 uni streams are consumed by control, QPACK encoder, and
+        // QPACK decoder. With max_streams_uni=3 and grease disabled, the next
+        // WT uni stream should fail with StreamLimit.
+        let before = s.client.h3_conn.next_uni_stream_id();
+        let result = s.client.open_uni_stream(&mut s.pipe.client);
+        assert!(result.is_err());
+        let after = s.client.h3_conn.next_uni_stream_id();
+        assert_eq!(before, after);
+    }
+
+    fn base_quic_config() -> crate::Config {
+        let mut config = crate::Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config
+            .load_cert_chain_from_pem_file("examples/cert.crt")
+            .unwrap();
+        config
+            .load_priv_key_from_pem_file("examples/cert.key")
+            .unwrap();
+        config
+            .set_application_protos(h3::APPLICATION_PROTOCOL)
+            .unwrap();
+        config.set_initial_max_data(10_000_000);
+        config.set_initial_max_stream_data_bidi_local(1_000_000);
+        config.set_initial_max_stream_data_bidi_remote(1_000_000);
+        config.set_initial_max_stream_data_uni(1_000_000);
+        config.set_initial_max_streams_bidi(100);
+        config.set_initial_max_streams_uni(100);
+        config.verify_peer(false);
+        config.enable_dgram(true, 100, 100);
+        config.set_ack_delay_exponent(8);
+        config.grease(false);
+        config
+    }
+
+    /// Server rejects WebTransport session when client does not advertise
+    /// extended CONNECT in SETTINGS.
+    #[test]
+    fn wt_accept_rejects_without_extended_connect() {
+        // Client has no extended connect or WT support.
+        let client_h3 = h3::Config::new().unwrap();
+
+        // Server has both enabled.
+        let mut server_h3 = h3::Config::new().unwrap();
+        server_h3.enable_extended_connect(true);
+        server_h3.enable_webtransport_draft02(true);
+
+        let mut config = base_quic_config();
+        let mut s: Session =
+            Session::with_separate_configs(&mut config, &client_h3, &server_h3)
+                .unwrap();
+
+        // Client sends CONNECT with :protocol: webtransport.
+        let stream_id =
+            s.client_connect(b"localhost", b"/", b"localhost").unwrap();
+
+        // Server receives the SessionRequest.
+        let (sid, ev) = s.poll_server().unwrap();
+        assert_eq!(sid, stream_id);
+        assert!(matches!(ev, super::Event::SessionRequest { .. }));
+
+        // Server rejects — client didn't advertise extended connect.
+        let result = s.server.accept(&mut s.pipe.server, stream_id);
+        assert_eq!(result, Err(h3::Error::RequestRejected));
+        assert_eq!(s.server.session_id(), None);
+
+        // Client receives the 400 response.
+        s.advance().unwrap();
+        let (sid, ev) = s.poll_client().unwrap();
+        assert_eq!(sid, stream_id);
+        match ev {
+            super::Event::H3(h3::Event::Headers { list, .. }) => {
+                let status = list
+                    .iter()
+                    .find(|h| h.name() == b":status")
+                    .map(|h| h.value())
+                    .unwrap();
+                assert_eq!(status, b"400");
+            },
+            _ => panic!("expected H3(Headers)"),
+        }
+
+        // Client also gets Finished on the closed CONNECT stream.
+        let (sid, ev) = s.poll_client().unwrap();
+        assert_eq!(sid, stream_id);
+        assert!(matches!(ev, super::Event::H3(h3::Event::Finished)));
+
+        assert_eq!(s.poll_client(), Err(h3::Error::Done));
+        assert_eq!(s.poll_server(), Err(h3::Error::Done));
+    }
+
+    /// Server rejects WebTransport session when client does not advertise
+    /// WebTransport draft-02 in SETTINGS.
+    #[test]
+    fn wt_accept_rejects_without_wt_draft02() {
+        // Client has extended connect but NOT webtransport draft-02.
+        let mut client_h3 = h3::Config::new().unwrap();
+        client_h3.enable_extended_connect(true);
+
+        // Server has both enabled.
+        let mut server_h3 = h3::Config::new().unwrap();
+        server_h3.enable_extended_connect(true);
+        server_h3.enable_webtransport_draft02(true);
+
+        let mut config = base_quic_config();
+        let mut s: Session =
+            Session::with_separate_configs(&mut config, &client_h3, &server_h3)
+                .unwrap();
+
+        // Client sends CONNECT with :protocol: webtransport.
+        let stream_id =
+            s.client_connect(b"localhost", b"/", b"localhost").unwrap();
+
+        // Server receives the SessionRequest.
+        let (sid, ev) = s.poll_server().unwrap();
+        assert_eq!(sid, stream_id);
+        assert!(matches!(ev, super::Event::SessionRequest { .. }));
+
+        // Server rejects — client didn't advertise WT draft-02.
+        let result = s.server.accept(&mut s.pipe.server, stream_id);
+        assert_eq!(result, Err(h3::Error::RequestRejected));
+        assert_eq!(s.server.session_id(), None);
+
+        // Client receives the 400 response.
+        s.advance().unwrap();
+        let (sid, ev) = s.poll_client().unwrap();
+        assert_eq!(sid, stream_id);
+        match ev {
+            super::Event::H3(h3::Event::Headers { list, .. }) => {
+                let status = list
+                    .iter()
+                    .find(|h| h.name() == b":status")
+                    .map(|h| h.value())
+                    .unwrap();
+                assert_eq!(status, b"400");
+            },
+            _ => panic!("expected H3(Headers)"),
+        }
+
+        // Client also gets Finished on the closed CONNECT stream.
+        let (sid, ev) = s.poll_client().unwrap();
+        assert_eq!(sid, stream_id);
+        assert!(matches!(ev, super::Event::H3(h3::Event::Finished)));
+
+        assert_eq!(s.poll_client(), Err(h3::Error::Done));
+        assert_eq!(s.poll_server(), Err(h3::Error::Done));
+    }
+}
