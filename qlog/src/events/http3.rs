@@ -47,6 +47,8 @@ pub enum StreamType {
     Unknown,
     QpackEncode,
     QpackDecode,
+    WebtransportUni,
+    WebtransportBi,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]

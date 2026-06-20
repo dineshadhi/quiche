@@ -46,6 +46,8 @@ pub const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x8;
 pub const SETTINGS_H3_DATAGRAM_00: u64 = 0x276;
 pub const SETTINGS_H3_DATAGRAM: u64 = 0x33;
 
+pub const SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02: u64 = 0x2b603742;
+
 // Permit between 16 maximally-encoded and 128 minimally-encoded SETTINGS.
 const MAX_SETTINGS_PAYLOAD_SIZE: usize = 256;
 
@@ -69,6 +71,7 @@ pub enum Frame {
         qpack_blocked_streams: Option<u64>,
         connect_protocol_enabled: Option<u64>,
         h3_datagram: Option<u64>,
+        webtransport_draft02: Option<u64>,
         grease: Option<(u64, u64)>,
         additional_settings: Option<Vec<(u64, u64)>>,
         raw: Option<Vec<(u64, u64)>>,
@@ -181,6 +184,7 @@ impl Frame {
                 qpack_blocked_streams,
                 connect_protocol_enabled,
                 h3_datagram,
+                webtransport_draft02,
                 grease,
                 additional_settings,
                 ..
@@ -211,6 +215,12 @@ impl Frame {
                     len += octets::varint_len(SETTINGS_H3_DATAGRAM_00);
                     len += octets::varint_len(*val);
                     len += octets::varint_len(SETTINGS_H3_DATAGRAM);
+                    len += octets::varint_len(*val);
+                }
+
+                if let Some(val) = webtransport_draft02 {
+                    len +=
+                        octets::varint_len(SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02);
                     len += octets::varint_len(*val);
                 }
 
@@ -253,6 +263,11 @@ impl Frame {
                     b.put_varint(SETTINGS_H3_DATAGRAM_00)?;
                     b.put_varint(*val)?;
                     b.put_varint(SETTINGS_H3_DATAGRAM)?;
+                    b.put_varint(*val)?;
+                }
+
+                if let Some(val) = webtransport_draft02 {
+                    b.put_varint(SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02)?;
                     b.put_varint(*val)?;
                 }
 
@@ -360,6 +375,7 @@ impl Frame {
                 qpack_blocked_streams,
                 connect_protocol_enabled,
                 h3_datagram,
+                webtransport_draft02,
                 grease,
                 additional_settings,
                 ..
@@ -403,6 +419,16 @@ impl Frame {
                 if let Some(v) = h3_datagram {
                     settings.push(qlog::events::http3::Setting {
                         name: Some("H3_DATAGRAM".to_string()),
+                        name_bytes: None,
+                        value: *v,
+                    });
+                }
+
+                if let Some(v) = webtransport_draft02 {
+                    settings.push(qlog::events::http3::Setting {
+                        name: Some(
+                            "SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02".to_string(),
+                        ),
                         name_bytes: None,
                         value: *v,
                     });
@@ -505,11 +531,12 @@ impl std::fmt::Debug for Frame {
                 max_field_section_size,
                 qpack_max_table_capacity,
                 qpack_blocked_streams,
+                webtransport_draft02,
                 additional_settings,
                 raw,
                 ..
             } => {
-                write!(f, "SETTINGS max_field_section={max_field_section_size:?}, qpack_max_table={qpack_max_table_capacity:?}, qpack_blocked={qpack_blocked_streams:?} raw={raw:?}, additional_settings={additional_settings:?}")?;
+                write!(f, "SETTINGS max_field_section={max_field_section_size:?}, qpack_max_table={qpack_max_table_capacity:?}, qpack_blocked={qpack_blocked_streams:?} webtransport_draft02={webtransport_draft02:?} raw={raw:?}, additional_settings={additional_settings:?}")?;
             },
 
             Frame::PushPromise {
@@ -573,6 +600,7 @@ fn parse_settings_frame(
     let mut qpack_blocked_streams = None;
     let mut connect_protocol_enabled = None;
     let mut h3_datagram = None;
+    let mut webtransport_draft02 = None;
     let mut raw = Vec::new();
     let mut additional_settings: Option<Vec<(u64, u64)>> = None;
 
@@ -618,6 +646,14 @@ fn parse_settings_frame(
                 h3_datagram = Some(value);
             },
 
+            SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02 => {
+                if value > 1 {
+                    return Err(super::Error::SettingsError);
+                }
+
+                webtransport_draft02 = Some(value);
+            },
+
             // Reserved values overlap with HTTP/2 and MUST be rejected
             0x0 | 0x2 | 0x3 | 0x4 | 0x5 =>
                 return Err(super::Error::SettingsError),
@@ -637,6 +673,7 @@ fn parse_settings_frame(
         qpack_blocked_streams,
         connect_protocol_enabled,
         h3_datagram,
+        webtransport_draft02,
         grease: None,
         raw: Some(raw),
         additional_settings,
@@ -788,6 +825,8 @@ mod tests {
             qpack_blocked_streams: Some(0),
             connect_protocol_enabled: Some(0),
             h3_datagram: Some(0),
+            webtransport_draft02: None,
+
             grease: None,
             raw: Some(raw_settings),
             additional_settings: None,
@@ -824,6 +863,8 @@ mod tests {
             qpack_blocked_streams: Some(0),
             connect_protocol_enabled: Some(0),
             h3_datagram: Some(0),
+            webtransport_draft02: None,
+
             grease: Some((33, 33)),
             raw: Default::default(),
             additional_settings: None,
@@ -847,6 +888,8 @@ mod tests {
             qpack_blocked_streams: Some(0),
             connect_protocol_enabled: Some(0),
             h3_datagram: Some(0),
+            webtransport_draft02: None,
+
             grease: None,
             raw: Some(raw_settings),
             additional_settings: Some(vec![(33, 33)]),
@@ -885,6 +928,8 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: None,
+            webtransport_draft02: None,
+
             grease: None,
             raw: Some(raw_settings),
             additional_settings: None,
@@ -923,6 +968,8 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: Some(1),
             h3_datagram: None,
+            webtransport_draft02: None,
+
             grease: None,
             raw: Some(raw_settings),
             additional_settings: None,
@@ -961,6 +1008,8 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: Some(9),
             h3_datagram: None,
+            webtransport_draft02: None,
+
             grease: None,
             raw: Some(raw_settings),
             additional_settings: None,
@@ -999,6 +1048,8 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: Some(1),
+            webtransport_draft02: None,
+
             grease: None,
             raw: Some(raw_settings),
             additional_settings: None,
@@ -1035,6 +1086,8 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: Some(5),
+            webtransport_draft02: None,
+
             grease: None,
             raw: Default::default(),
             additional_settings: None,
@@ -1075,6 +1128,8 @@ mod tests {
             qpack_blocked_streams: Some(0),
             connect_protocol_enabled: None,
             h3_datagram: None,
+            webtransport_draft02: None,
+
             grease: None,
             raw: Some(raw_settings),
             additional_settings: None,
@@ -1191,6 +1246,46 @@ mod tests {
                 &d[frame_header_len..]
             ),
             Err(crate::h3::Error::ExcessiveLoad)
+        );
+    }
+
+    #[test]
+    fn settings_webtransport_draft02() {
+        let mut d = [42; 128];
+
+        let raw_settings = vec![(SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02, 1)];
+
+        let frame = Frame::Settings {
+            max_field_section_size: None,
+            qpack_max_table_capacity: None,
+            qpack_blocked_streams: None,
+            connect_protocol_enabled: None,
+            h3_datagram: None,
+            webtransport_draft02: Some(1),
+
+            grease: None,
+            raw: Some(raw_settings),
+            additional_settings: None,
+        };
+
+        let frame_payload_len = 5;
+        let frame_header_len = 2;
+
+        let wire_len = {
+            let mut b = octets::OctetsMut::with_slice(&mut d);
+            frame.to_bytes(&mut b).unwrap()
+        };
+
+        assert_eq!(wire_len, frame_header_len + frame_payload_len);
+
+        assert_eq!(
+            Frame::from_bytes(
+                SETTINGS_FRAME_TYPE_ID,
+                frame_payload_len as u64,
+                &d[frame_header_len..]
+            )
+            .unwrap(),
+            frame
         );
     }
 

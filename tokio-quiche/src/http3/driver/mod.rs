@@ -691,6 +691,7 @@ impl<H: DriverHooks> H3Driver<H> {
                     .map_err(|_| H3ConnectionError::ControllerWentAway)?;
                 Ok(())
             },
+            _ => Ok(()),
         }
     }
 

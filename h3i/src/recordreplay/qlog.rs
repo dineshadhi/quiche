@@ -543,6 +543,7 @@ impl From<H3FrameCreatedEx> for Action {
                         grease: None,
                         raw: Some(raw_settings),
                         additional_settings: Some(additional_settings),
+                        webtransport_draft02: None,
                     },
                     expected_result: Default::default(),
                 }

@@ -62,6 +62,7 @@ pub fn prompt_settings() -> InquireResult<Action> {
             grease: None,
             raw: None,
             additional_settings: Some(settings),
+            webtransport_draft02: None,
         },
         expected_result: Default::default(),
     };

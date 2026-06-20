@@ -335,6 +335,7 @@ impl Serialize for SerializableQFrame<'_> {
                 grease: _,
                 additional_settings,
                 raw: _,
+                webtransport_draft02: _,
             } => {
                 let mut state = s.serialize_struct(name, 6)?;
                 state.serialize_field(

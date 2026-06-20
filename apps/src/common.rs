@@ -752,6 +752,9 @@ fn make_h3_config(
         config.set_qpack_blocked_streams(v.clamp(0, 0));
     }
 
+    config.enable_extended_connect(true);
+    config.enable_webtransport_draft02(true);
+
     config
 }
 
@@ -1367,6 +1370,7 @@ impl HttpConn for Http3Conn {
 
                     break;
                 },
+                _ => {},
             }
         }
 
@@ -1564,6 +1568,7 @@ impl HttpConn for Http3Conn {
 
                     return Err(e);
                 },
+                _ => {},
             }
         }
 

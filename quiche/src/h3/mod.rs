@@ -178,6 +178,14 @@
 //!              // Peer signalled it is going away, handle it.
 //!         },
 //!
+//!         Ok((_stream_id, quiche::h3::Event::WebtransportStream { .. })) => {
+//!             // WebTransport stream received, handle it.
+//!         },
+//!
+//!         Ok((_stream_id, quiche::h3::Event::WebtransportData)) => {
+//!             // WebTransport data received, handle it.
+//!         },
+//!
 //!         Err(quiche::h3::Error::Done) => {
 //!             // Done reading.
 //!             break;
@@ -237,6 +245,14 @@
 //!
 //!         Ok((goaway_id, quiche::h3::Event::GoAway)) => {
 //!              // Peer signalled it is going away, handle it.
+//!         },
+//!
+//!         Ok((_stream_id, quiche::h3::Event::WebtransportStream { .. })) => {
+//!             // WebTransport stream received, handle it.
+//!         },
+//!
+//!         Ok((_stream_id, quiche::h3::Event::WebtransportData)) => {
+//!             // WebTransport data received, handle it.
 //!         },
 //!
 //!         Err(quiche::h3::Error::Done) => {
@@ -568,6 +584,7 @@ pub struct Config {
     qpack_max_table_capacity: Option<u64>,
     qpack_blocked_streams: Option<u64>,
     connect_protocol_enabled: Option<u64>,
+    webtransport_draft02: Option<u64>,
     /// additional settings are settings that are not part of the H3
     /// settings explicitly handled above
     additional_settings: Option<Vec<(u64, u64)>>,
@@ -581,6 +598,7 @@ impl Config {
             qpack_max_table_capacity: None,
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
+            webtransport_draft02: None,
             additional_settings: None,
         })
     }
@@ -623,6 +641,17 @@ impl Config {
         }
     }
 
+    /// Sets or omits the `SETTINGS_ENABLE_WEBTRANSPORT` (draft-02) setting.
+    ///
+    /// The default value is `false`.
+    pub fn enable_webtransport_draft02(&mut self, enabled: bool) {
+        if enabled {
+            self.webtransport_draft02 = Some(1);
+        } else {
+            self.webtransport_draft02 = None;
+        }
+    }
+
     /// Sets additional HTTP/3 settings.
     ///
     /// The default value is no additional settings.
@@ -634,6 +663,8 @@ impl Config {
     /// - SETTINGS_QPACK_BLOCKED_STREAMS
     /// - SETTINGS_ENABLE_CONNECT_PROTOCOL
     /// - SETTINGS_H3_DATAGRAM
+    /// - SETTINGS_ENABLE_WEBTRANSPORT (draft-02)
+    /// - SETTINGS_ENABLE_WEBTRANSPORT (draft-07)
     ///
     /// If such a setting is present in the `additional_settings`,
     /// the method will return the [`Error::SettingsError`] error.
@@ -652,6 +683,7 @@ impl Config {
             frame::SETTINGS_ENABLE_CONNECT_PROTOCOL,
             frame::SETTINGS_H3_DATAGRAM,
             frame::SETTINGS_H3_DATAGRAM_00,
+            frame::SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02,
         ]);
 
         let dedup_settings: HashSet<u64> =
@@ -802,6 +834,18 @@ pub enum Event {
 
     /// GOAWAY was received.
     GoAway,
+
+    /// Webtransport Stream
+    WebtransportStream {
+        /// Webtransport Session ID
+        session_id: u64,
+    },
+
+    /// Webtransport data was received.
+    ///
+    /// This indicates that the application can read data from the WebTransport
+    /// stream using [`quiche::Connection::stream_recv()`].
+    WebtransportData,
 }
 
 /// Extensible Priorities parameters.
@@ -908,6 +952,7 @@ struct ConnectionSettings {
     pub qpack_blocked_streams: Option<u64>,
     pub connect_protocol_enabled: Option<u64>,
     pub h3_datagram: Option<u64>,
+    pub webtransport_draft02: Option<u64>,
     pub additional_settings: Option<Vec<(u64, u64)>>,
     pub raw: Option<Vec<(u64, u64)>>,
 }
@@ -960,7 +1005,7 @@ fn close_conn_if_critical_stream_finished<F: BufFactory>(
 pub struct Connection {
     is_server: bool,
 
-    next_request_stream_id: u64,
+    next_bidi_stream_id: u64,
     next_uni_stream_id: u64,
 
     streams: crate::stream::StreamIdHashMap<stream::Stream>,
@@ -1001,7 +1046,7 @@ impl Connection {
         Ok(Connection {
             is_server,
 
-            next_request_stream_id: 0,
+            next_bidi_stream_id: if is_server { 1 } else { 0 },
 
             next_uni_stream_id: initial_uni_stream_id,
 
@@ -1013,6 +1058,7 @@ impl Connection {
                 qpack_blocked_streams: config.qpack_blocked_streams,
                 connect_protocol_enabled: config.connect_protocol_enabled,
                 h3_datagram,
+                webtransport_draft02: config.webtransport_draft02,
                 additional_settings: config.additional_settings.clone(),
                 raw: Default::default(),
             },
@@ -1023,6 +1069,7 @@ impl Connection {
                 qpack_blocked_streams: None,
                 h3_datagram: None,
                 connect_protocol_enabled: None,
+                webtransport_draft02: None,
                 additional_settings: Default::default(),
                 raw: Default::default(),
             },
@@ -1125,7 +1172,7 @@ impl Connection {
             return Err(Error::FrameUnexpected);
         }
 
-        let stream_id = self.next_request_stream_id;
+        let stream_id = self.next_bidi_stream_id();
 
         self.streams
             .insert(stream_id, <stream::Stream>::new(stream_id, true));
@@ -1159,10 +1206,7 @@ impl Connection {
 
         // To avoid skipping stream IDs, we only calculate the next available
         // stream ID when a request has been successfully buffered.
-        self.next_request_stream_id = self
-            .next_request_stream_id
-            .checked_add(4)
-            .ok_or(Error::IdError)?;
+        self.advance_next_bidi_stream_id()?;
 
         Ok(stream_id)
     }
@@ -1779,6 +1823,58 @@ impl Connection {
         self.peer_settings.connect_protocol_enabled == Some(1)
     }
 
+    /// Returns whether the peer enabled WebTransport draft-02 support.
+    ///
+    /// Support is signalled by the peer's SETTINGS, so this method always
+    /// returns false until they have been processed using the [`poll()`]
+    /// method.
+    ///
+    /// [`poll()`]: struct.Connection.html#method.poll
+    pub fn webtransport_draft02_enabled_by_peer(&self) -> bool {
+        self.peer_settings.webtransport_draft02 == Some(1)
+    }
+
+    /// Returns the next available unidirectional stream ID without advancing.
+    pub(crate) fn next_uni_stream_id(&self) -> u64 {
+        self.next_uni_stream_id
+    }
+
+    /// Advances (increments by 4) the unidirectional stream ID counter.
+    pub(crate) fn advance_next_uni_stream_id(&mut self) -> Result<()> {
+        self.next_uni_stream_id = self
+            .next_uni_stream_id
+            .checked_add(4)
+            .ok_or(Error::IdError)?;
+        Ok(())
+    }
+
+    /// Returns the next available bidirectional stream ID without advancing.
+    pub(crate) fn next_bidi_stream_id(&self) -> u64 {
+        self.next_bidi_stream_id
+    }
+
+    /// Advances (increments by 4) the bidirectional stream ID counter.
+    pub(crate) fn advance_next_bidi_stream_id(&mut self) -> Result<()> {
+        self.next_bidi_stream_id = self
+            .next_bidi_stream_id
+            .checked_add(4)
+            .ok_or(Error::IdError)?;
+        Ok(())
+    }
+
+    /// Pre-registers a locally-initiated WebTransport stream so the H3
+    /// layer treats incoming data as WebTransport data rather than HTTP/3
+    /// frames.
+    pub(crate) fn register_webtransport_stream(&mut self, stream_id: u64) {
+        use crate::h3::stream::Stream;
+
+        self.streams.entry(stream_id).or_insert_with(|| {
+            let mut s = Stream::new(stream_id, true);
+            s.set_webtransport_state();
+            s
+        });
+    }
+
     /// Reads request or response body data into the provided buffer.
     ///
     /// Applications should call this method whenever the [`poll()`] method
@@ -2223,7 +2319,7 @@ impl Connection {
     fn open_uni_stream<F: BufFactory>(
         &mut self, conn: &mut super::Connection<F>, ty: u64,
     ) -> Result<u64> {
-        let stream_id = self.next_uni_stream_id;
+        let stream_id = self.next_uni_stream_id();
 
         let mut d = [0; 8];
         let mut b = octets::OctetsMut::with_slice(&mut d);
@@ -2249,10 +2345,7 @@ impl Connection {
 
         // To avoid skipping stream IDs, we only calculate the next available
         // stream ID when data has been successfully buffered.
-        self.next_uni_stream_id = self
-            .next_uni_stream_id
-            .checked_add(4)
-            .ok_or(Error::IdError)?;
+        self.advance_next_uni_stream_id()?;
 
         Ok(stream_id)
     }
@@ -2483,6 +2576,7 @@ impl Connection {
                 .local_settings
                 .connect_protocol_enabled,
             h3_datagram: self.local_settings.h3_datagram,
+            webtransport_draft02: self.local_settings.webtransport_draft02,
             grease,
             additional_settings: self.local_settings.additional_settings.clone(),
             raw: Default::default(),
@@ -2494,6 +2588,22 @@ impl Connection {
         frame.to_bytes(&mut b)?;
 
         let off = b.off();
+
+        info!(
+            "{} sending SETTINGS frame: connect_protocol={:?} \
+             webtransport_draft02={:?} \
+             h3_datagram={:?} max_field_section_size={:?} \
+             qpack_max_table_capacity={:?} qpack_blocked_streams={:?} \
+             additional_settings={:?}",
+            conn.trace_id(),
+            self.local_settings.connect_protocol_enabled,
+            self.local_settings.webtransport_draft02,
+            self.local_settings.h3_datagram,
+            self.local_settings.max_field_section_size,
+            self.local_settings.qpack_max_table_capacity,
+            self.local_settings.qpack_blocked_streams,
+            self.local_settings.additional_settings,
+        );
 
         if let Some(id) = self.control_stream_id {
             conn.stream_send(id, &d[..off], false)?;
@@ -2616,7 +2726,6 @@ impl Connection {
 
                             self.peer_control_stream_id = Some(stream_id);
                         },
-
                         stream::Type::Push => {
                             // Server push is not supported, so push streams at
                             // either client or server is a critical protocol
@@ -2629,7 +2738,6 @@ impl Connection {
 
                             return Err(Error::StreamCreationError);
                         },
-
                         stream::Type::QpackEncoder => {
                             // Only one qpack encoder stream allowed.
                             if self.peer_qpack_streams.encoder_stream_id.is_some()
@@ -2650,7 +2758,6 @@ impl Connection {
                             self.peer_qpack_streams.encoder_stream_id =
                                 Some(stream_id);
                         },
-
                         stream::Type::QpackDecoder => {
                             // Only one qpack decoder allowed.
                             if self.peer_qpack_streams.decoder_stream_id.is_some()
@@ -2671,16 +2778,15 @@ impl Connection {
                             self.peer_qpack_streams.decoder_stream_id =
                                 Some(stream_id);
                         },
-
                         stream::Type::Unknown => {
                             // Unknown stream types are ignored.
                             // TODO: we MAY send STOP_SENDING
                         },
-
                         stream::Type::Request => unreachable!(),
+                        stream::Type::WebtransportUniStream |
+                        stream::Type::WebtransportBiStream => continue,
                     }
                 },
-
                 stream::State::PushId => {
                     stream.try_fill_buffer(conn)?;
 
@@ -2695,7 +2801,6 @@ impl Connection {
                         return Err(e);
                     }
                 },
-
                 stream::State::FrameType => {
                     stream.try_fill_buffer(conn)?;
 
@@ -2704,6 +2809,15 @@ impl Connection {
 
                         Err(_) => continue,
                     };
+
+                    // WebTransport bidirectional streams use 0x41 as their
+                    // stream type, but the h3 layer treats all bidirectional
+                    // streams as request streams by default. Intercept here
+                    // and reroute to the WebTransport session ID path.
+                    if varint == stream::WEBTRANSPORT_BI {
+                        stream.set_as_webtransport_bidi_stream()?;
+                        continue;
+                    }
 
                     match stream.set_frame_type(varint) {
                         Err(Error::FrameUnexpected) => {
@@ -2731,7 +2845,6 @@ impl Connection {
                         _ => (),
                     }
                 },
-
                 stream::State::FramePayloadLen => {
                     stream.try_fill_buffer(conn)?;
 
@@ -2771,7 +2884,6 @@ impl Connection {
                         return Err(e);
                     }
                 },
-
                 stream::State::FramePayload => {
                     // Do not emit events when not polling.
                     if !polling {
@@ -2813,7 +2925,6 @@ impl Connection {
                         Err(e) => return Err(e),
                     };
                 },
-
                 stream::State::Data => {
                     // Do not emit events when not polling.
                     if !polling {
@@ -2826,7 +2937,6 @@ impl Connection {
 
                     return Ok((stream_id, Event::Data));
                 },
-
                 stream::State::QpackInstruction => {
                     let mut d = [0; 4096];
 
@@ -2849,7 +2959,6 @@ impl Connection {
                         }
                     }
                 },
-
                 stream::State::Drain => {
                     // Discard incoming data on the stream.
                     conn.stream_shutdown(
@@ -2860,8 +2969,31 @@ impl Connection {
 
                     break;
                 },
-
                 stream::State::Finished => break,
+                stream::State::WebtransportData => {
+                    // Do not emit events when not polling.
+                    if !polling {
+                        break;
+                    }
+
+                    if !stream.try_trigger_data_event() {
+                        break;
+                    }
+
+                    return Ok((stream_id, Event::WebtransportData));
+                },
+                stream::State::WebTransportSessionID => {
+                    stream.try_fill_buffer(conn)?;
+                    let session_id = match stream.try_consume_varint() {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    stream.set_webtransport_data_state();
+                    return Ok((stream_id, Event::WebtransportStream {
+                        session_id,
+                    }));
+                },
             }
         }
 
@@ -2976,16 +3108,29 @@ impl Connection {
                 qpack_blocked_streams,
                 connect_protocol_enabled,
                 h3_datagram,
+                webtransport_draft02,
                 additional_settings,
                 raw,
                 ..
             } => {
+                info!(
+                    "{} SETTINGS received: connect_protocol={:?}, \
+                     webtransport_draft02={:?}, \
+                     h3_datagram={:?}, raw={:?}",
+                    conn.trace_id(),
+                    connect_protocol_enabled,
+                    webtransport_draft02,
+                    h3_datagram,
+                    raw,
+                );
+
                 self.peer_settings = ConnectionSettings {
                     max_field_section_size,
                     qpack_max_table_capacity,
                     qpack_blocked_streams,
                     connect_protocol_enabled,
                     h3_datagram,
+                    webtransport_draft02,
                     additional_settings,
                     raw,
                 };
@@ -6700,6 +6845,7 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: Some(1),
+            webtransport_draft02: None,
             grease: None,
             additional_settings: Default::default(),
             raw: Default::default(),
@@ -6821,6 +6967,13 @@ mod tests {
                 .set_additional_settings(vec![(frame::SETTINGS_H3_DATAGRAM, 43)]),
             Err(Error::SettingsError)
         );
+        assert_eq!(
+            h3_config.set_additional_settings(vec![(
+                frame::SETTINGS_ENABLE_WEBTRANSPORT_DRAFT02,
+                1
+            )]),
+            Err(Error::SettingsError)
+        );
     }
 
     #[test]
@@ -6838,6 +6991,7 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: None,
+            webtransport_draft02: None,
             grease: None,
             additional_settings: Default::default(),
             raw: Default::default(),

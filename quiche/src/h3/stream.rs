@@ -35,6 +35,8 @@ pub const HTTP3_CONTROL_STREAM_TYPE_ID: u64 = 0x0;
 pub const HTTP3_PUSH_STREAM_TYPE_ID: u64 = 0x1;
 pub const QPACK_ENCODER_STREAM_TYPE_ID: u64 = 0x2;
 pub const QPACK_DECODER_STREAM_TYPE_ID: u64 = 0x3;
+pub const WEBTRANSPORT_UNI: u64 = 0x54;
+pub const WEBTRANSPORT_BI: u64 = 0x41;
 
 const MAX_STATE_BUF_SIZE: usize = (1 << 24) - 1;
 
@@ -46,6 +48,8 @@ pub enum Type {
     QpackEncoder,
     QpackDecoder,
     Unknown,
+    WebtransportUniStream,
+    WebtransportBiStream,
 }
 
 impl Type {
@@ -58,6 +62,10 @@ impl Type {
             Type::QpackEncoder => qlog::events::http3::StreamType::QpackEncode,
             Type::QpackDecoder => qlog::events::http3::StreamType::QpackDecode,
             Type::Unknown => qlog::events::http3::StreamType::Unknown,
+            Type::WebtransportUniStream =>
+                qlog::events::http3::StreamType::WebtransportUni,
+            Type::WebtransportBiStream =>
+                qlog::events::http3::StreamType::WebtransportBi,
         }
     }
 }
@@ -90,6 +98,12 @@ pub enum State {
 
     /// All data has been read.
     Finished,
+
+    /// Webtransport SessionID
+    WebTransportSessionID,
+
+    /// Webtransport Data
+    WebtransportData,
 }
 
 impl Type {
@@ -99,6 +113,8 @@ impl Type {
             HTTP3_PUSH_STREAM_TYPE_ID => Ok(Type::Push),
             QPACK_ENCODER_STREAM_TYPE_ID => Ok(Type::QpackEncoder),
             QPACK_DECODER_STREAM_TYPE_ID => Ok(Type::QpackDecoder),
+            WEBTRANSPORT_UNI => Ok(Type::WebtransportUniStream),
+            WEBTRANSPORT_BI => Ok(Type::WebtransportBiStream),
 
             _ => Ok(Type::Unknown),
         }
@@ -252,10 +268,20 @@ impl Stream {
             },
 
             Type::Unknown => State::Drain,
+            Type::WebtransportUniStream | Type::WebtransportBiStream =>
+                State::WebTransportSessionID,
         };
 
         self.state_transition(state, 1, true)?;
 
+        Ok(())
+    }
+
+    /// Re-classifies this stream as a WebTransport bidirectional stream
+    /// and transitions to reading the session ID.
+    pub fn set_as_webtransport_bidi_stream(&mut self) -> Result<()> {
+        self.ty = Some(Type::WebtransportBiStream);
+        self.state_transition(State::WebTransportSessionID, 1, true)?;
         Ok(())
     }
 
@@ -668,6 +694,23 @@ impl Stream {
         let _ = self.state_transition(State::Finished, 0, false);
     }
 
+    /// Sets the stream state to WebtransportData.
+    pub fn set_webtransport_data_state(&mut self) {
+        let _ = self.state_transition(State::WebtransportData, 0, false);
+    }
+
+    /// Sets the stream type and transitions to WebTransport data state.
+    /// Used for locally-initiated streams where the session ID has
+    /// already been written by the opener.
+    pub fn set_webtransport_state(&mut self) {
+        self.ty = if crate::stream::is_bidi(self.id) {
+            Some(Type::WebtransportBiStream)
+        } else {
+            Some(Type::WebtransportUniStream)
+        };
+        let _ = self.state_transition(State::WebtransportData, 0, false);
+    }
+
     /// Tries to read DATA payload from the given cursor.
     ///
     /// This is intended to replace `try_consume_data()` in tests, in order to
@@ -704,7 +747,7 @@ impl Stream {
     }
 
     /// Resets the data triggered state.
-    fn reset_data_event(&mut self) {
+    pub fn reset_data_event(&mut self) {
         self.data_event_triggered = false;
     }
 
@@ -826,6 +869,8 @@ mod tests {
             qpack_blocked_streams: Some(0),
             connect_protocol_enabled: None,
             h3_datagram: None,
+            webtransport_draft02: None,
+
             grease: None,
             additional_settings: None,
             raw: Some(raw_settings),
@@ -876,6 +921,8 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: None,
+            webtransport_draft02: None,
+
             grease: None,
             additional_settings: None,
             raw: Some(vec![]),
@@ -932,6 +979,8 @@ mod tests {
             qpack_blocked_streams: Some(0),
             connect_protocol_enabled: None,
             h3_datagram: None,
+            webtransport_draft02: None,
+
             grease: None,
             additional_settings: None,
             raw: Some(raw_settings),
@@ -997,6 +1046,8 @@ mod tests {
             qpack_blocked_streams: Some(0),
             connect_protocol_enabled: None,
             h3_datagram: None,
+            webtransport_draft02: None,
+
             grease: None,
             additional_settings: None,
             raw: Some(raw_settings),
@@ -1041,6 +1092,8 @@ mod tests {
             qpack_blocked_streams: Some(0),
             connect_protocol_enabled: None,
             h3_datagram: None,
+            webtransport_draft02: None,
+
             grease: None,
             additional_settings: None,
             raw: Some(raw_settings),
@@ -1427,6 +1480,8 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: None,
+            webtransport_draft02: None,
+
             grease: None,
             additional_settings: None,
             raw: Some(vec![]),
@@ -1508,6 +1563,8 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: None,
+            webtransport_draft02: None,
+
             grease: None,
             additional_settings: None,
             raw: Some(vec![]),
@@ -1556,6 +1613,8 @@ mod tests {
             qpack_blocked_streams: None,
             connect_protocol_enabled: None,
             h3_datagram: None,
+            webtransport_draft02: None,
+
             grease: None,
             additional_settings: None,
             raw: Some(vec![]),
